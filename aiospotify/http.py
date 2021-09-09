@@ -40,7 +40,7 @@ from .errors import (
     ServerError,
     NotAuthorized,
 )
-from .types._spotify import ID, MARKETS
+from .types._spotify import ID, MARKETS, PARAMS, RESPONSE
 
 try:
     import orjson
@@ -56,9 +56,6 @@ __all__: Tuple[str] = ("HTTPClient",)
 
 
 log = logging.getLogger(__name__)
-
-PARAMS = Dict[str, Any]
-RESPONSE = Dict[str, Any]
 
 
 class Route:
@@ -83,7 +80,7 @@ class HTTPClient:
     if TYPE_CHECKING:
         _access_token: str
         _expires_at: datetime.datetime
-        _session: aiohttp.ClientSession
+        session: aiohttp.ClientSession
 
     def __init__(
         self, client_id: str, client_secret: str, *, loop: asyncio.AbstractEventLoop
@@ -98,8 +95,11 @@ class HTTPClient:
         """The base method to make all requests. This method do not handle login/authorization"""
 
         if not hasattr(
-            self, "_session"
+            self, "session"
         ):  # User didn't call authorize before making request
+            log.critical(
+                "Unauthorized - client should be authorized before making any requests to the API"
+            )
             raise NotAuthorized(
                 "You need to authorize first before making any requests"
             )
@@ -117,51 +117,95 @@ class HTTPClient:
         headers: Dict[str, str] = {"Authorization": f"Bearer {self._access_token}"}
 
         async with self.lock:
-            log.debug("Dispatching %s request on %s with %s", method, url, params)
-            async with self._session.request(
-                method, url, headers=headers, params=params
-            ) as response:
+            try_auth_count = 0  # We try to authorize 2 times in case we receive 401 (Unauthorized) # fmt: off
+
+            # If we get rate limited, try 5 more times after sleep.
+            # If we're unauthorized, the same loop handles and tries to authorize twice
+            for _ in range(5):
                 log.debug(
-                    "%s on %s with %s has responded with %s",
-                    method,
-                    url,
-                    params,
-                    response.status,
+                    "Dispatching %s request on %s with params %s", method, url, params
                 )
+                async with self.session.request(
+                    method, url, headers=headers, params=params
+                ) as response:
+                    log.debug(
+                        "%s on %s with params %s has responded with %s",
+                        method,
+                        url,
+                        params,
+                        response.status,
+                    )
 
-                data: Dict[str, Any] = await response.json(
-                    encoding="utf-8", loads=_from_json
-                )
+                    if response.status == 429:  # Rate Limited
+                        return_headers = response.headers
+                        retry_after: float = float(return_headers["Retry-After"])
+                        log.warning(
+                            "We are getting rate limited. Retrying in %s seconds.",
+                            retry_after,
+                        )
 
-                if 200 <= response.status < 300:  # Successful
-                    log.debug("Received data from (%s) %s: %s", method, url, data)
-                    return data
+                        await asyncio.sleep(retry_after)
+                        log.debug("Done sleeping for the rate limit. Retrying...")
 
-                if response.status == 401:  # Unauthorized (Reauthorize and try again)
-                    await self.authorize()
-                    return await self.request(route)
+                        continue  # let the loop continue and request again
 
-                if response.status == 403:
-                    raise Forbidden(data, response.status)
-                if response.status == 404:
-                    raise NotFound(data, response.status)
+                    else:
+                        data: Dict[str, Any] = await response.json(
+                            encoding="utf-8", loads=_from_json
+                        )
 
-                if response.status == 429:  # Rate Limited
-                    ...  # TODO: Later
+                        if 200 <= response.status < 300:  # Successful
+                            log.debug(
+                                "Received data from (%s) %s: %s", method, url, data
+                            )
+                            return data
 
-                if response.status in {500, 502, 503}:
-                    raise ServerError(data, response.status)
+                        elif (
+                            response.status == 401
+                        ):  # Unauthorized (Reauthorize and try again)
+                            # We try twice to authorize (the same loop for ratelimit handling handles this too)
+                            if try_auth_count < 2:
+                                await self.authorize()
+                                try_auth_count += 1
+                                continue
+                            else:
+                                # If we're here, this means we failed to authorize twice
+                                raise NotAuthorized(
+                                    "Failed to Authorize while trying to make request"
+                                )
 
-                # Handles: 304, 400
-                raise HTTPException(data, response.status)
+                        elif response.status == 403:
+                            log.error("%s Forbidden - %s", response.status, data)
+                            raise Forbidden(data, response.status)
+
+                        elif response.status == 404:
+                            log.error("%s Not Found - %s", response.status, data)
+                            raise NotFound(data, response.status)
+
+                        elif response.status in {500, 502, 503}:
+                            log.critical("%s Server Error - %s", response.status, data)
+                            raise ServerError(data, response.status)
+
+                        elif response.status in {304, 400}:
+                            log.error("%s HTTP Exception - %s", response.status, data)
+                            raise HTTPException(data, response.status)
+
+            # If we're here, then probably we failed to handle the rate limit 5 times
+            # Or we missed handling some error code (probably not)
+            _error = {  # We don't have any native data to supply, so construct one ourselves # fmt: off
+                "error": "Rate Limited",
+                "error_description": "You are being rate limited. Try again later",
+            }
+            raise HTTPException(_error, 429, "Failed to handle rate limits.")
 
     async def authorize(self) -> None:
         """Authorize to the API and gets the Authorization Token to make requests.
         This method must be called before making any requests to the API, else it'll result to unhandled Exceptions.
         """
 
-        if not hasattr(self, "_session"):
-            self._session = aiohttp.ClientSession(loop=self.loop)
+        if not hasattr(self, "session"):
+            self.session = aiohttp.ClientSession(loop=self.loop)
+            log.debug("Created HTTP Session")
 
         auth_url: str = self.ACCOUNT_BASE + "token/"
         body = {"grant_type": "client_credentials"}
@@ -170,7 +214,8 @@ class HTTPClient:
         )
         headers: Dict[str, str] = {"Authorization": f'Basic {encoded.decode("ascii")}'}
 
-        response = aiohttp.ClientResponse = await self._session.post(
+        log.info("Logging in with client credentials")
+        response = aiohttp.ClientResponse = await self.session.post(
             auth_url, headers=headers, data=body
         )
         data: Dict[str, Any] = await response.json()
@@ -181,6 +226,8 @@ class HTTPClient:
             self._expires_at = datetime.datetime.utcnow() + datetime.timedelta(
                 seconds=data["expires_in"]
             )
+            log.info("200 - Authorization Successful")
+            return
 
         except AssertionError:
             if response.status in {
@@ -214,9 +261,9 @@ class HTTPClient:
     async def destroy(self) -> None:
         """Destroys and cleans the sessions"""
 
-        if self._session and not self._session.closed:
-            await self._session.close()
-            log.debug("Closed aiohttp session")
+        if self.session and not self.session.closed:
+            await self.session.close()
+            log.debug("Closed session")
 
     # Albums API (https://developer.spotify.com/documentation/web-api/reference/#category-albums)
 
