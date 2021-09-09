@@ -48,8 +48,9 @@ class HTTPException(SpotifyException):
         fmt = f'{status_code} {data["error"]}'
         if desc := data.get("error_description") is not None:
             fmt += f": {desc}"
-        else:
-            fmt += f': {data["error"]["message"]}'
+
+        if msg := data.get("message") is not None:
+            fmt += f": {msg}"
 
         if message is not None:
             fmt += f" ({message})"
