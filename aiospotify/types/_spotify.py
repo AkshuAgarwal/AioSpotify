@@ -23,20 +23,17 @@ SOFTWARE.
 """
 
 from __future__ import annotations
-from typing import Literal
+from typing import Any, Dict, Literal
 
 
 URI = str
 
 ID = str
 
-CATEGORY_ID = str
-
-USER_ID = str
-
-PLAYLIST_ID = str
-
 URL = str
+
+RESPONSE = Dict[str, Any]
+PARAMS = Dict[str, Any]
 
 MARKETS = Literal[
     "AF",
